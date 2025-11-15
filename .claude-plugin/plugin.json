@@ -1,0 +1,64 @@
+{
+  "name": "realtimestt-bridge",
+  "version": "0.1.0",
+  "description": "Use RealtimeSTT for one-shot speech-to-text from Claude via /stt-once.",
+  "commands": [
+    {
+      "name": "stt-once",
+      "title": "One-shot speech-to-text via RealtimeSTT",
+      "description": "Listens to the microphone once using RealtimeSTT and returns the transcript to Claude.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "language": {
+            "type": "string",
+            "description": "Language code hint for transcription (e.g. 'de', 'en').",
+            "nullable": true
+          },
+          "max_seconds": {
+            "type": "number",
+            "description": "Maximum recording duration in seconds before stopping automatically.",
+            "nullable": true
+          },
+          "silence_timeout": {
+            "type": "number",
+            "description": "Seconds of silence after which recording is stopped.",
+            "nullable": true
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "stt-arm",
+      "title": "Arm continuous RealtimeSTT listener",
+      "description": "Starts a background RealtimeSTT daemon that listens for trigger phrases (e.g. 'Claudia schreibe ...').",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "language": {
+            "type": "string",
+            "description": "Language code hint for transcription (e.g. 'de', 'en').",
+            "nullable": true
+          },
+          "trigger_prefix": {
+            "type": "string",
+            "description": "Trigger phrase that should activate actions (e.g. 'claude schreibe').",
+            "nullable": true
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "stt-disarm",
+      "title": "Stop continuous RealtimeSTT listener",
+      "description": "Stops the background RealtimeSTT daemon if it is running.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  ]
+}
