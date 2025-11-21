@@ -1,25 +1,21 @@
 #!/usr/bin/env node
 
 /**
- * stt-once.cjs - Speech-to-Text for Claude Code
+ * stt-once-improved.cjs
  *
- * Providers:
- * - "fast" (default): faster-whisper with tiny model (~2-3 sec, offline, free)
- * - "local": RealtimeSTT/Whisper (slow, offline)
- * - "cloud": OpenAI Whisper API (requires OPENAI_API_KEY, ~1-2 sec)
+ * Speech-to-Text command with provider selection:
+ * - "cloud": OpenAI Whisper API (fast, ~1-2 sec, requires API key)
+ * - "local": RealtimeSTT/Whisper (slow without GPU, offline)
  *
- * Recommended: "fast" for CPU-only systems without API keys
+ * Default: "cloud" (recommended for most users)
  */
 
-const { execFile, spawn } = require("node:child_process");
+const { execFile } = require("node:child_process");
 const path = require("path");
 
-// Provider script mapping
-const PROVIDER_SCRIPTS = {
-  fast: "stt_fast_local.py",
-  local: "stt_once.py",
-  cloud: "stt_cloud.py"
-};
+// Provider scripts
+const CLOUD_SCRIPT = "stt_cloud.py";
+const LOCAL_SCRIPT = "stt_once.py";
 
 async function readStdinJson() {
   const chunks = [];
@@ -39,28 +35,20 @@ function runPythonScript(script, payload) {
   return new Promise((resolve) => {
     const scriptPath = path.join(__dirname, "..", script);
 
-    // Build environment
-    const env = {
-      ...process.env,
-      STT_LANGUAGE: payload.language || "",
-      STT_MAX_SECONDS: payload.max_seconds != null ? String(payload.max_seconds) : "60",
-      STT_SILENCE_THRESHOLD: payload.silence_threshold != null ? String(payload.silence_threshold) : "2.0",
-      STT_MODEL: payload.model || "tiny"
-    };
-
-    // For RealtimeSTT compatibility
-    if (payload.silence_timeout != null) {
-      env.STT_SILENCE_TIMEOUT = String(payload.silence_timeout);
-    }
-
     const child = execFile(
       "python3",
       [scriptPath],
       {
         cwd: path.join(__dirname, ".."),
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: 180000, // 3 minutes max
-        env: env
+        maxBuffer: 10 * 1024 * 1024, // 10MB
+        timeout: 120000, // 2 minutes max
+        env: {
+          ...process.env,
+          STT_LANGUAGE: payload.language || "",
+          STT_MAX_SECONDS: payload.max_seconds != null ? String(payload.max_seconds) : "",
+          STT_SILENCE_TIMEOUT: payload.silence_timeout != null ? String(payload.silence_timeout) : "",
+          STT_SILENCE_THRESHOLD: payload.silence_threshold != null ? String(payload.silence_threshold) : ""
+        }
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -68,19 +56,19 @@ function runPythonScript(script, payload) {
             resolve({
               ok: false,
               type: "missing",
-              message: `python3 or ${script} not found.`
+              message: `python3 or ${script} not found. Ensure Python is installed.`
             });
           } else if (error.killed) {
             resolve({
               ok: false,
               type: "timeout",
-              message: "Recording/transcription timed out."
+              message: "Recording timed out after 2 minutes."
             });
           } else {
             resolve({
               ok: false,
               type: "error",
-              message: stderr.toString().trim() || error.message
+              message: `${script} error:\n${stderr.toString().trim() || error.message}`
             });
           }
         } else {
@@ -91,7 +79,7 @@ function runPythonScript(script, payload) {
             resolve({
               ok: false,
               type: "parse_error",
-              message: `Parse error: ${stdout.toString().trim()}`
+              message: `Failed to parse output from ${script}.\nRaw:\n${stdout.toString().trim()}`
             });
           }
         }
@@ -103,7 +91,7 @@ function runPythonScript(script, payload) {
         resolve({
           ok: false,
           type: "missing",
-          message: "python3 not found."
+          message: `python3 not found. Install Python 3.`
         });
       }
     });
@@ -113,34 +101,26 @@ function runPythonScript(script, payload) {
 async function main() {
   const payload = await readStdinJson();
 
-  // Default to fast provider (faster-whisper with tiny model)
-  let provider = (payload.provider || "fast").toLowerCase();
+  // Default to cloud provider (faster)
+  const provider = (payload.provider || "cloud").toLowerCase();
 
-  // Aliases
-  if (provider === "openai" || provider === "whisper-api") {
-    provider = "cloud";
-  }
-  if (provider === "offline" || provider === "faster-whisper") {
-    provider = "fast";
-  }
-  if (provider === "realtimestt") {
-    provider = "local";
-  }
-
-  const script = PROVIDER_SCRIPTS[provider];
-
-  if (!script) {
+  let script;
+  if (provider === "local") {
+    script = LOCAL_SCRIPT;
+  } else if (provider === "cloud" || provider === "openai") {
+    script = CLOUD_SCRIPT;
+  } else {
     const response = {
       success: false,
       error_type: "invalid_provider",
-      message: `Unknown provider "${provider}". Available: fast (recommended), local, cloud`,
+      message: `Unknown provider "${provider}". Use "cloud" (recommended) or "local".`,
       retryable: false
     };
     process.stdout.write(JSON.stringify(response, null, 2));
     process.exit(1);
   }
 
-  console.error(`STT Provider: ${provider} (${script})`);
+  console.error(`Using STT provider: ${provider}`);
 
   const result = await runPythonScript(script, payload);
 
@@ -159,6 +139,7 @@ async function main() {
   const data = result.data || {};
 
   if (data.success === false) {
+    // Python script returned an error
     const response = {
       success: false,
       error_type: data.error || "error",
@@ -173,14 +154,13 @@ async function main() {
   const response = {
     success: true,
     transcript: data.transcript || "",
-    provider: data.provider || provider,
-    processing_time: data.processing_time || null,
-    model: data.model || null
+    provider: provider,
+    processing_time: data.processing_time || null
   };
   process.stdout.write(JSON.stringify(response, null, 2));
 }
 
 main().catch((err) => {
-  console.error("Unexpected error:", err);
+  console.error("Unexpected error in stt-once:", err);
   process.exit(1);
 });
