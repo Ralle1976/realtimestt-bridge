@@ -1,64 +1,118 @@
 {
   "name": "realtimestt-bridge",
-  "version": "0.1.0",
-  "description": "Use RealtimeSTT for one-shot speech-to-text from Claude via /stt-once.",
+  "version": "2.0.0",
+  "description": "Speech-to-Text for Claude Code with multi-provider support (faster-whisper, RealtimeSTT, OpenAI API)",
+  "author": "Ralle1976",
+  "repository": "https://github.com/Ralle1976/realtimestt-bridge",
+
   "commands": [
     {
       "name": "stt-once",
-      "title": "One-shot speech-to-text via RealtimeSTT",
-      "description": "Listens to the microphone once using RealtimeSTT and returns the transcript to Claude.",
+      "title": "One-shot speech-to-text",
+      "description": "Records from microphone and transcribes using faster-whisper (local) or OpenAI API (cloud).",
       "input_schema": {
         "type": "object",
         "properties": {
+          "provider": {
+            "type": "string",
+            "description": "Provider: fast (default, local), local (RealtimeSTT), cloud (OpenAI API)",
+            "default": "fast"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model: distil-de (BEST for German), distil-en, tiny, base, small",
+            "default": "distil-de"
+          },
           "language": {
             "type": "string",
-            "description": "Language code hint for transcription (e.g. 'de', 'en').",
-            "nullable": true
+            "description": "Language code (e.g. 'de', 'en')"
           },
           "max_seconds": {
             "type": "number",
-            "description": "Maximum recording duration in seconds before stopping automatically.",
-            "nullable": true
+            "description": "Maximum recording duration in seconds",
+            "default": 60
           },
-          "silence_timeout": {
+          "silence_threshold": {
             "type": "number",
-            "description": "Seconds of silence after which recording is stopped.",
-            "nullable": true
+            "description": "Seconds of silence to stop recording",
+            "default": 2.0
           }
-        },
-        "required": []
+        }
+      }
+    },
+    {
+      "name": "stt-models",
+      "title": "STT Model Management",
+      "description": "List, download, or remove STT models.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Action: list, status, download, remove",
+            "default": "list"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model name for download/remove actions"
+          }
+        }
       }
     },
     {
       "name": "stt-arm",
-      "title": "Arm continuous RealtimeSTT listener",
-      "description": "Starts a background RealtimeSTT daemon that listens for trigger phrases (e.g. 'Claudia schreibe ...').",
+      "title": "Start continuous listening",
+      "description": "Starts background daemon for voice-triggered transcription.",
       "input_schema": {
         "type": "object",
         "properties": {
           "language": {
             "type": "string",
-            "description": "Language code hint for transcription (e.g. 'de', 'en').",
-            "nullable": true
+            "description": "Language code (e.g. 'de', 'en')",
+            "default": "de"
           },
           "trigger_prefix": {
             "type": "string",
-            "description": "Trigger phrase that should activate actions (e.g. 'claude schreibe').",
-            "nullable": true
+            "description": "Voice trigger phrase",
+            "default": "claude schreibe"
           }
-        },
-        "required": []
+        }
       }
     },
     {
       "name": "stt-disarm",
-      "title": "Stop continuous RealtimeSTT listener",
-      "description": "Stops the background RealtimeSTT daemon if it is running.",
+      "title": "Stop continuous listening",
+      "description": "Stops the background voice listener daemon.",
       "input_schema": {
         "type": "object",
-        "properties": {},
-        "required": []
+        "properties": {}
       }
     }
-  ]
+  ],
+
+  "agents": [
+    {
+      "name": "stt-agent",
+      "description": "Speech-to-Text sub-agent for voice input, dictation, and hands-free coding",
+      "path": "agents/stt-agent.md"
+    }
+  ],
+
+  "models": {
+    "recommended": "distil-de",
+    "available": [
+      {"id": "distil-de", "size": "1.5 GB", "speed": "~0.5-1s", "description": "BEST for German"},
+      {"id": "distil-en", "size": "1.5 GB", "speed": "~0.5-1s", "description": "BEST for English"},
+      {"id": "tiny", "size": "39 MB", "speed": "~2-3s", "description": "Fastest, basic quality"},
+      {"id": "base", "size": "142 MB", "speed": "~4-6s", "description": "Good balance"},
+      {"id": "small", "size": "466 MB", "speed": "~10-15s", "description": "Better quality"},
+      {"id": "medium", "size": "1.5 GB", "speed": "~20-30s", "description": "High quality"},
+      {"id": "large-v3", "size": "3.1 GB", "speed": "~40-60s", "description": "Best quality (slow on CPU)"}
+    ]
+  },
+
+  "requirements": {
+    "python": "pip install faster-whisper pyaudio",
+    "linux": "sudo apt-get install python3-dev portaudio19-dev"
+  }
 }

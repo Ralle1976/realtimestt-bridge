@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-Fast Local Speech-to-Text using faster-whisper with tiny/base model
+Fast Local Speech-to-Text using faster-whisper with optimized models
 
 Uses faster-whisper with CTranslate2 optimization for CPU performance.
 Much faster than standard Whisper on CPU-only systems.
 
-Model comparison (on CPU):
-- tiny:  ~2-3 seconds processing for 10 sec audio (RECOMMENDED)
-- base:  ~4-6 seconds processing
-- small: ~10-15 seconds processing
-- turbo: ~20-40 seconds processing (too slow without GPU)
+Model comparison (on CPU, 10 sec audio):
+- tiny:        ~2-3 seconds (basic quality)
+- base:        ~4-6 seconds (good quality)
+- small:       ~10-15 seconds (better quality)
+- distil-de:   ~0.5-1 second (BEST for German!) - 6x faster than large!
+- distil-en:   ~0.5-1 second (BEST for English!)
+
+RECOMMENDED: Use "distil-de" for German speech - fastest AND best quality!
 
 Requirements:
 - pip install faster-whisper
@@ -21,7 +24,8 @@ Environment Variables:
   STT_LANGUAGE - Language code (e.g., "de", "en"), default: auto-detect
   STT_MAX_SECONDS - Maximum recording time in seconds, default: 60
   STT_SILENCE_THRESHOLD - Silence duration to stop recording, default: 2.0
-  STT_MODEL - Whisper model: "tiny", "base", "small", default: "tiny"
+  STT_MODEL - Whisper model: "tiny", "base", "small", "distil-de", "distil-en"
+             default: "distil-de" (optimized for German)
 """
 
 import io
@@ -147,20 +151,40 @@ def record_audio(max_seconds: float = 60.0, silence_threshold: float = 2.0) -> b
 # Global model cache to avoid reloading
 _model_cache = {}
 
+# Model name mapping - maps short names to HuggingFace model IDs
+MODEL_MAPPING = {
+    "tiny": "tiny",
+    "base": "base",
+    "small": "small",
+    "distil-de": "primeline/whisper-large-v3-turbo-german",  # Optimized German model
+    "distil-en": "distil-whisper/distil-large-v3",  # Optimized English model
+    "distil-large": "distil-whisper/distil-large-v3",  # General distil model
+}
+
+# Language hints for models
+MODEL_LANGUAGE = {
+    "distil-de": "de",
+    "distil-en": "en",
+}
+
 
 def get_model(model_size: str):
     """Get or create cached Whisper model."""
     global _model_cache
 
-    if model_size not in _model_cache:
+    # Resolve model name to actual model ID
+    actual_model = MODEL_MAPPING.get(model_size, model_size)
+    cache_key = actual_model
+
+    if cache_key not in _model_cache:
         from faster_whisper import WhisperModel
 
-        print(f"Loading whisper model: {model_size}...", file=sys.stderr)
+        print(f"Loading whisper model: {model_size} ({actual_model})...", file=sys.stderr)
         start = time.time()
 
         # Use INT8 quantization for faster CPU inference
-        _model_cache[model_size] = WhisperModel(
-            model_size,
+        _model_cache[cache_key] = WhisperModel(
+            actual_model,
             device="cpu",
             compute_type="int8"
         )
@@ -168,7 +192,7 @@ def get_model(model_size: str):
         elapsed = time.time() - start
         print(f"Model loaded in {elapsed:.1f}s", file=sys.stderr)
 
-    return _model_cache[model_size]
+    return _model_cache[cache_key]
 
 
 def transcribe_local(audio_data: bytes, language: str = None, model_size: str = "tiny") -> dict:
@@ -191,8 +215,11 @@ def transcribe_local(audio_data: bytes, language: str = None, model_size: str = 
             "vad_filter": True,  # Filter out non-speech
         }
 
+        # Use language hint from model if not explicitly provided
         if language:
             kwargs["language"] = language
+        elif model_size in MODEL_LANGUAGE:
+            kwargs["language"] = MODEL_LANGUAGE[model_size]
 
         segments, info = model.transcribe(tmp_path, **kwargs)
 
@@ -248,8 +275,8 @@ def main():
     silence_threshold = float(os.getenv("STT_SILENCE_THRESHOLD") or "2.0")
     model_size = os.getenv("STT_MODEL") or "tiny"
 
-    # Validate model
-    valid_models = ["tiny", "base", "small"]
+    # Validate model - includes new distil models as additional options
+    valid_models = list(MODEL_MAPPING.keys())
     if model_size not in valid_models:
         print(json.dumps({
             "success": False,
