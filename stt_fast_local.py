@@ -156,9 +156,12 @@ MODEL_MAPPING = {
     "tiny": "tiny",
     "base": "base",
     "small": "small",
-    "distil-de": "primeline/whisper-large-v3-turbo-german",  # Optimized German model
-    "distil-en": "distil-whisper/distil-large-v3",  # Optimized English model
-    "distil-large": "distil-whisper/distil-large-v3",  # General distil model
+    "medium": "medium",
+    "large-v3": "large-v3",
+    "distil-de": "large-v3-turbo",  # Turbo-optimiert, 8x schneller, super für Deutsch
+    "distil-en": "distil-large-v3",  # Optimized English model
+    "distil-large": "distil-large-v3",  # General distil model
+    "turbo": "large-v3-turbo",  # Alias für distil-de
 }
 
 # Language hints for models

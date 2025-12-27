@@ -15,6 +15,10 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
+// Config directory for selected model
+const CONFIG_DIR = path.join(os.homedir(), ".config", "claude-stt");
+const SELECTED_MODEL_FILE = path.join(CONFIG_DIR, "selected_model");
+
 // Model definitions
 const MODELS = {
   // Standard Whisper models
@@ -50,9 +54,9 @@ const MODELS = {
   },
   // Distilled/optimized models
   "distil-de": {
-    size: "1.5 GB",
-    description: "BEST for German! 6x faster than large",
-    hfId: "primeline/whisper-large-v3-turbo-german",
+    size: "1.6 GB",
+    description: "BEST for German! Turbo-optimiert, 8x schneller",
+    hfId: "large-v3-turbo",
     speed: "~0.5-1s",
     recommended: true
   },
@@ -75,6 +79,27 @@ function getHfCacheDir() {
   return process.env.HF_HOME ||
          process.env.HUGGINGFACE_HUB_CACHE ||
          path.join(os.homedir(), ".cache", "huggingface", "hub");
+}
+
+// Ensure config directory exists
+function ensureConfigDir() {
+  if (!fs.existsSync(CONFIG_DIR)) {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  }
+}
+
+// Get currently selected model
+function getSelectedModel() {
+  if (fs.existsSync(SELECTED_MODEL_FILE)) {
+    return fs.readFileSync(SELECTED_MODEL_FILE, "utf8").trim();
+  }
+  return "tiny"; // Default
+}
+
+// Set selected model
+function setSelectedModel(modelKey) {
+  ensureConfigDir();
+  fs.writeFileSync(SELECTED_MODEL_FILE, modelKey);
 }
 
 // Check if model is downloaded
@@ -100,25 +125,77 @@ function isModelDownloaded(modelKey) {
 
 // List all models with status
 function listModels() {
-  console.log("\n=== Available STT Models ===\n");
-  console.log("Model         | Size     | Speed    | Status | Description");
-  console.log("--------------|----------|----------|--------|---------------------------");
+  const selected = getSelectedModel();
+
+  console.log("\n=== STT-MODELLE - Speech-to-Text Model Manager ===\n");
+  console.log("Modell        | Grosse   | Speed    | Status   | Beschreibung");
+  console.log("--------------|----------|----------|----------|---------------------------");
 
   for (const [key, model] of Object.entries(MODELS)) {
     const downloaded = isModelDownloaded(key);
-    const status = downloaded ? "✅" : "⬜";
-    const rec = model.recommended ? " (RECOMMENDED)" : "";
+    const isSelected = key === selected;
+
+    // Status indicator
+    let status;
+    if (isSelected && downloaded) {
+      status = "[AKTIV] ";
+    } else if (downloaded) {
+      status = "[OK]    ";
+    } else {
+      status = "[-]     ";
+    }
+
+    const rec = model.recommended ? " *EMPFOHLEN*" : "";
     const name = key.padEnd(13);
     const size = model.size.padEnd(8);
     const speed = model.speed.padEnd(8);
 
-    console.log(`${name} | ${size} | ${speed} | ${status}     | ${model.description}${rec}`);
+    console.log(`${name} | ${size} | ${speed} | ${status} | ${model.description}${rec}`);
   }
 
-  console.log("\nUsage:");
-  console.log("  /stt-models {\"action\": \"download\", \"model\": \"distil-de\"}");
-  console.log("  /stt-models {\"action\": \"remove\", \"model\": \"tiny\"}");
+  console.log("\n------------------------------------------------------------");
+  console.log("Legende: [AKTIV] = Ausgewahlt, [OK] = Heruntergeladen, [-] = Nicht installiert");
+  console.log(`\nAktuell ausgewahlt: ${selected}`);
+  console.log("\nAktionen:");
+  console.log('  Download:  /stt-models {"action": "download", "model": "distil-de"}');
+  console.log('  Auswahlen: /stt-models {"action": "select", "model": "distil-de"}');
+  console.log('  Entfernen: /stt-models {"action": "remove", "model": "tiny"}');
+  console.log('  Status:    /stt-models {"action": "status"}');
+  console.log("\nEmpfehlung fur Deutsch: distil-de (schnell & genau)");
   console.log("");
+}
+
+// Select a model (must be downloaded first)
+function selectModel(modelKey) {
+  const model = MODELS[modelKey];
+  if (!model) {
+    return {
+      success: false,
+      error: "invalid_model",
+      message: `Unbekanntes Modell '${modelKey}'. Verfugbar: ${Object.keys(MODELS).join(", ")}`
+    };
+  }
+
+  if (!isModelDownloaded(modelKey)) {
+    return {
+      success: false,
+      error: "not_downloaded",
+      message: `Modell '${modelKey}' ist nicht heruntergeladen. Bitte zuerst herunterladen:\n  /stt-models {"action": "download", "model": "${modelKey}"}`
+    };
+  }
+
+  setSelectedModel(modelKey);
+
+  return {
+    success: true,
+    message: `Modell '${modelKey}' wurde ausgewahlt und ist jetzt aktiv.`,
+    model: modelKey,
+    info: {
+      size: model.size,
+      speed: model.speed,
+      description: model.description
+    }
+  };
 }
 
 // Download a model
@@ -221,11 +298,13 @@ function removeModel(modelKey) {
 function getStatus() {
   const status = {};
   let totalDownloaded = 0;
+  const selected = getSelectedModel();
 
   for (const key of Object.keys(MODELS)) {
     const downloaded = isModelDownloaded(key);
     status[key] = {
       downloaded,
+      selected: key === selected,
       ...MODELS[key]
     };
     if (downloaded) totalDownloaded++;
@@ -233,6 +312,7 @@ function getStatus() {
 
   return {
     success: true,
+    selectedModel: selected,
     totalModels: Object.keys(MODELS).length,
     downloadedModels: totalDownloaded,
     models: status
@@ -288,10 +368,22 @@ async function main() {
         result = {
           success: false,
           error: "missing_model",
-          message: "Please specify a model to remove: {\"action\": \"remove\", \"model\": \"tiny\"}"
+          message: "Bitte Modell angeben: {\"action\": \"remove\", \"model\": \"tiny\"}"
         };
       } else {
         result = removeModel(modelKey);
+      }
+      break;
+
+    case "select":
+      if (!modelKey) {
+        result = {
+          success: false,
+          error: "missing_model",
+          message: "Bitte Modell angeben: {\"action\": \"select\", \"model\": \"distil-de\"}"
+        };
+      } else {
+        result = selectModel(modelKey);
       }
       break;
 
@@ -299,7 +391,7 @@ async function main() {
       result = {
         success: false,
         error: "invalid_action",
-        message: `Unknown action '${action}'. Use: list, status, download, remove`
+        message: `Unbekannte Aktion '${action}'. Verfugbar: list, status, download, select, remove`
       };
   }
 
