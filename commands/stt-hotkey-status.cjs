@@ -5,71 +5,67 @@
  */
 
 const fs = require("node:fs");
+const {
+  getRuntimePaths,
+  isProcessRunning,
+  isSymlink,
+  readPidFile,
+  readStdinJson,
+  safeReadTextFile
+} = require("../lib/stt-runtime.cjs");
 
-const PID_FILE = "/tmp/stt_daemon.pid";
-const STATUS_FILE = "/tmp/stt_status";
-const TRANSCRIPT_FILE = "/tmp/stt_transcript.txt";
-
-async function readStdinJson() {
-  const chunks = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(chunk);
+function isDaemonRunning(pidFile) {
+  const pid = readPidFile(pidFile);
+  if (pid !== null && isProcessRunning(pid)) {
+    return pid;
   }
-  if (!chunks.length) return {};
+  return null;
+}
+
+function getStatus(statusFile) {
+  const raw = safeReadTextFile(statusFile);
+  if (raw) {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function getLastTranscript(transcriptFile) {
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (!fs.existsSync(transcriptFile) || isSymlink(transcriptFile)) {
+      return null;
+    }
+    const stat = fs.statSync(transcriptFile);
+    if (!stat.isFile()) return null;
+    return {
+      text: fs.readFileSync(transcriptFile, "utf8").trim(),
+      modified: stat.mtime.toISOString()
+    };
   } catch {
-    return {};
+    return null;
   }
-}
-
-function isDaemonRunning() {
-  try {
-    if (fs.existsSync(PID_FILE)) {
-      const pid = parseInt(fs.readFileSync(PID_FILE, "utf8").trim());
-      process.kill(pid, 0);
-      return pid;
-    }
-  } catch {}
-  return null;
-}
-
-function getStatus() {
-  try {
-    if (fs.existsSync(STATUS_FILE)) {
-      return JSON.parse(fs.readFileSync(STATUS_FILE, "utf8"));
-    }
-  } catch {}
-  return null;
-}
-
-function getLastTranscript() {
-  try {
-    if (fs.existsSync(TRANSCRIPT_FILE)) {
-      const stat = fs.statSync(TRANSCRIPT_FILE);
-      return {
-        text: fs.readFileSync(TRANSCRIPT_FILE, "utf8").trim(),
-        modified: stat.mtime.toISOString()
-      };
-    }
-  } catch {}
-  return null;
 }
 
 async function main() {
   await readStdinJson();
+  const paths = getRuntimePaths();
 
-  const pid = isDaemonRunning();
-  const status = getStatus();
-  const transcript = getLastTranscript();
+  const pid = isDaemonRunning(paths.pidFile);
+  const status = pid !== null ? getStatus(paths.statusFile) : null;
+  const transcript = getLastTranscript(paths.transcriptFile);
 
   const response = {
     success: true,
     daemon_running: pid !== null,
     pid: pid,
-    status: status?.status || "not_running",
+    status: pid !== null ? (status?.status || "ready") : "not_running",
     model: status?.model || process.env.STT_MODEL || "distil-de",
-    language: process.env.STT_LANGUAGE || "de"
+    language: process.env.STT_LANGUAGE || "de",
+    runtime_dir: paths.runtimeDir
   };
 
   if (transcript) {
@@ -78,11 +74,13 @@ async function main() {
 
   if (pid) {
     response.controls = {
-      start_recording: "touch /tmp/stt_start",
-      stop_recording: "touch /tmp/stt_stop",
-      toggle: `kill -SIGUSR1 ${pid}`,
+      start_recording: paths.startTrigger,
+      stop_recording: paths.stopTrigger,
       hotkey: "F9"
     };
+    if (process.platform !== "win32") {
+      response.controls.toggle = `kill -SIGUSR1 ${pid}`;
+    }
   } else {
     response.hint = "Starte Daemon mit /stt-hotkey-start";
   }

@@ -21,19 +21,19 @@ You are a specialized agent that interfaces with the local Speech-to-Text system
 ### Single Recording (Most Common)
 
 ```bash
-echo '{"provider": "fast", "model": "distil-de", "language": "de"}' | /home/ralle/.claude/commands/stt-once
+echo '{"provider": "fast", "model": "distil-de", "language": "de"}' | ~/.claude/commands/stt-once
 ```
 
 ### Check Available Models
 
 ```bash
-echo '{"action": "status"}' | /home/ralle/.claude/commands/stt-models
+echo '{"action": "status"}' | ~/.claude/commands/stt-models
 ```
 
 ### Download a Model (if needed)
 
 ```bash
-echo '{"action": "download", "model": "distil-de"}' | /home/ralle/.claude/commands/stt-models
+echo '{"action": "download", "model": "distil-de"}' | ~/.claude/commands/stt-models
 ```
 
 ## Available Models
@@ -81,17 +81,17 @@ When user says "I want to dictate some code":
 
 1. **Check model availability:**
    ```bash
-   echo '{"action": "status"}' | /home/ralle/.claude/commands/stt-models
+   echo '{"action": "status"}' | ~/.claude/commands/stt-models
    ```
 
 2. **If distil-de not downloaded, download it:**
    ```bash
-   echo '{"action": "download", "model": "distil-de"}' | /home/ralle/.claude/commands/stt-models
+   echo '{"action": "download", "model": "distil-de"}' | ~/.claude/commands/stt-models
    ```
 
 3. **Start recording:**
    ```bash
-   echo '{"language": "de", "model": "distil-de"}' | /home/ralle/.claude/commands/stt-once
+   echo '{"language": "de", "model": "distil-de"}' | ~/.claude/commands/stt-once
    ```
 
 4. **Parse the transcript and use it**
@@ -110,12 +110,12 @@ For longer dictation sessions:
 
 **Start listening:**
 ```bash
-echo '{"language": "de"}' | /home/ralle/.claude/commands/stt-arm
+echo '{"language": "de"}' | ~/.claude/commands/stt-arm
 ```
 
 **Stop listening:**
 ```bash
-echo '{}' | /home/ralle/.claude/commands/stt-disarm
+echo '{}' | ~/.claude/commands/stt-disarm
 ```
 
 Voice triggers in continuous mode:

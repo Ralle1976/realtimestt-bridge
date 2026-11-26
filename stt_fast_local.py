@@ -37,6 +37,8 @@ import time
 import wave
 from pathlib import Path
 
+from stt_common import calculate_rms, parse_positive_float_env, validate_language
+
 # Audio recording parameters
 CHUNK = 1024
 FORMAT_PYAUDIO = None
@@ -75,44 +77,43 @@ def check_dependencies():
 def record_audio(max_seconds: float = 60.0, silence_threshold: float = 2.0) -> bytes:
     """Record audio from microphone until silence is detected."""
     import pyaudio
-    import struct
-    import math
 
     p = pyaudio.PyAudio()
-
-    try:
-        default_device = p.get_default_input_device_info()
-        device_index = default_device['index']
-    except IOError:
-        device_index = None
-        for i in range(p.get_device_count()):
-            dev = p.get_device_info_by_index(i)
-            if dev['maxInputChannels'] > 0:
-                device_index = i
-                break
-
-        if device_index is None:
-            p.terminate()
-            raise RuntimeError("No audio input device found")
-
-    stream = p.open(
-        format=FORMAT_PYAUDIO,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,
-        input_device_index=device_index,
-        frames_per_buffer=CHUNK
-    )
-
+    stream = None
     frames = []
-    start_time = time.time()
-    last_sound_time = time.time()
-    has_speech = False
-    SILENCE_RMS_THRESHOLD = 500
-
-    print("Recording... (speak now)", file=sys.stderr)
 
     try:
+        try:
+            default_device = p.get_default_input_device_info()
+            device_index = default_device["index"]
+        except IOError:
+            device_index = None
+            for i in range(p.get_device_count()):
+                dev = p.get_device_info_by_index(i)
+                if dev["maxInputChannels"] > 0:
+                    device_index = i
+                    break
+
+            if device_index is None:
+                raise RuntimeError("No audio input device found")
+
+        audio_format = FORMAT_PYAUDIO if FORMAT_PYAUDIO is not None else pyaudio.paInt16
+        stream = p.open(
+            format=audio_format,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            input_device_index=device_index,
+            frames_per_buffer=CHUNK
+        )
+
+        start_time = time.time()
+        last_sound_time = start_time
+        has_speech = False
+        SILENCE_RMS_THRESHOLD = 500
+
+        print("Recording... (speak now)", file=sys.stderr)
+
         while True:
             elapsed = time.time() - start_time
             if elapsed > max_seconds:
@@ -121,8 +122,7 @@ def record_audio(max_seconds: float = 60.0, silence_threshold: float = 2.0) -> b
             data = stream.read(CHUNK, exception_on_overflow=False)
             frames.append(data)
 
-            shorts = struct.unpack(f'{CHUNK}h', data)
-            rms = math.sqrt(sum(s ** 2 for s in shorts) / CHUNK)
+            rms = calculate_rms(data)
 
             if rms > SILENCE_RMS_THRESHOLD:
                 has_speech = True
@@ -132,8 +132,11 @@ def record_audio(max_seconds: float = 60.0, silence_threshold: float = 2.0) -> b
                 break
 
     finally:
-        stream.stop_stream()
-        stream.close()
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            finally:
+                stream.close()
         p.terminate()
 
     print("Recording finished.", file=sys.stderr)
@@ -219,8 +222,9 @@ def transcribe_local(audio_data: bytes, language: str = None, model_size: str = 
         }
 
         # Use language hint from model if not explicitly provided
-        if language:
-            kwargs["language"] = language
+        validated_language = validate_language(language)
+        if validated_language:
+            kwargs["language"] = validated_language
         elif model_size in MODEL_LANGUAGE:
             kwargs["language"] = MODEL_LANGUAGE[model_size]
 
@@ -229,7 +233,9 @@ def transcribe_local(audio_data: bytes, language: str = None, model_size: str = 
         # Collect all segments
         transcript_parts = []
         for segment in segments:
-            transcript_parts.append(segment.text.strip())
+            text = segment.text.strip()
+            if text:
+                transcript_parts.append(text)
 
         elapsed = time.time() - start
 
@@ -251,6 +257,13 @@ def transcribe_local(audio_data: bytes, language: str = None, model_size: str = 
             "provider": "faster-whisper"
         }
 
+    except ValueError as e:
+        return {
+            "success": False,
+            "error": "invalid_input",
+            "message": str(e)
+        }
+
     except Exception as e:
         return {
             "success": False,
@@ -260,8 +273,8 @@ def transcribe_local(audio_data: bytes, language: str = None, model_size: str = 
 
     finally:
         try:
-            Path(tmp_path).unlink()
-        except:
+            Path(tmp_path).unlink(missing_ok=True)
+        except OSError:
             pass
 
 
@@ -273,10 +286,19 @@ def main():
         print(json.dumps(dep_error))
         return
 
-    language = os.getenv("STT_LANGUAGE") or None
-    max_seconds = float(os.getenv("STT_MAX_SECONDS") or "60")
-    silence_threshold = float(os.getenv("STT_SILENCE_THRESHOLD") or "2.0")
-    model_size = os.getenv("STT_MODEL") or "tiny"
+    try:
+        language = validate_language(os.getenv("STT_LANGUAGE"))
+        max_seconds = parse_positive_float_env("STT_MAX_SECONDS", 60.0, min_value=0.1, max_value=3600.0)
+        silence_threshold = parse_positive_float_env("STT_SILENCE_THRESHOLD", 2.0, min_value=0.05, max_value=300.0)
+    except ValueError as exc:
+        print(json.dumps({
+            "success": False,
+            "error": "invalid_config",
+            "message": str(exc)
+        }))
+        return
+
+    model_size = (os.getenv("STT_MODEL") or "").strip() or "tiny"
 
     # Validate model - includes new distil models as additional options
     valid_models = list(MODEL_MAPPING.keys())

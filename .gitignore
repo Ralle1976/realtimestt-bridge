@@ -4,12 +4,14 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.pytest_cache/
 env/
 venv/
 *.egg-info/
 
-# Logs
+# Logs & runtime state
 *.log
+*.pid
 stt_daemon.log
 stt_triggers.jsonl
 

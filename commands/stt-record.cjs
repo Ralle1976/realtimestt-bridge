@@ -10,61 +10,55 @@
  *   { "action": "get" }     - Holt letztes Transkript
  */
 
-const fs = require("node:fs");
+const {
+  atomicWriteFile,
+  getRuntimePaths,
+  isProcessRunning,
+  readPidFile,
+  readStdinJson,
+  safeReadTextFile
+} = require("../lib/stt-runtime.cjs");
 
-const PID_FILE = "/tmp/stt_daemon.pid";
-const STATUS_FILE = "/tmp/stt_status";
-const TRANSCRIPT_FILE = "/tmp/stt_transcript.txt";
-const START_TRIGGER = "/tmp/stt_start";
-const STOP_TRIGGER = "/tmp/stt_stop";
-
-async function readStdinJson() {
-  const chunks = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(chunk);
+function isDaemonRunning(pidFile) {
+  const pid = readPidFile(pidFile);
+  if (pid !== null && isProcessRunning(pid)) {
+    return pid;
   }
-  if (!chunks.length) return {};
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    return {};
-  }
-}
-
-function isDaemonRunning() {
-  try {
-    if (fs.existsSync(PID_FILE)) {
-      const pid = parseInt(fs.readFileSync(PID_FILE, "utf8").trim());
-      process.kill(pid, 0);
-      return pid;
-    }
-  } catch {}
   return null;
 }
 
-function getStatus() {
-  try {
-    if (fs.existsSync(STATUS_FILE)) {
-      return JSON.parse(fs.readFileSync(STATUS_FILE, "utf8"));
+function getStatus(statusFile) {
+  const raw = safeReadTextFile(statusFile);
+  if (raw) {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // Ignore corrupt status file
     }
-  } catch {}
+  }
   return { status: "not_running" };
 }
 
-function getTranscript() {
-  try {
-    if (fs.existsSync(TRANSCRIPT_FILE)) {
-      return fs.readFileSync(TRANSCRIPT_FILE, "utf8").trim();
-    }
-  } catch {}
-  return null;
+function getTranscript(transcriptFile) {
+  const raw = safeReadTextFile(transcriptFile);
+  return raw !== null ? raw.trim() : null;
+}
+
+function getWaitMs() {
+  const raw = Number(process.env.STT_RECORD_WAIT_MS);
+  if (Number.isFinite(raw) && raw >= 0 && raw <= 30000) {
+    return raw;
+  }
+  return 2000;
 }
 
 async function main() {
+  const paths = getRuntimePaths();
   const payload = await readStdinJson();
-  const action = payload.action || "toggle";
+  const rawAction = payload.action === undefined || payload.action === null ? "toggle" : payload.action;
+  const action = typeof rawAction === "string" ? rawAction.trim().toLowerCase() : "";
 
-  const pid = isDaemonRunning();
+  const pid = isDaemonRunning(paths.pidFile);
 
   if (!pid) {
     console.log(JSON.stringify({
@@ -75,7 +69,8 @@ async function main() {
     return;
   }
 
-  const status = getStatus();
+  const status = getStatus(paths.statusFile);
+  const waitMs = getWaitMs();
 
   switch (action) {
     case "start":
@@ -86,7 +81,7 @@ async function main() {
           status: "recording"
         }, null, 2));
       } else {
-        fs.writeFileSync(START_TRIGGER, "");
+        atomicWriteFile(paths.startTrigger, "");
         console.log(JSON.stringify({
           success: true,
           message: "Aufnahme gestartet",
@@ -104,10 +99,11 @@ async function main() {
           status: status.status
         }, null, 2));
       } else {
-        fs.writeFileSync(STOP_TRIGGER, "");
-        // Wait for processing
-        await new Promise(r => setTimeout(r, 2000));
-        const transcript = getTranscript();
+        atomicWriteFile(paths.stopTrigger, "");
+        if (waitMs > 0) {
+          await new Promise((r) => setTimeout(r, waitMs));
+        }
+        const transcript = getTranscript(paths.transcriptFile);
         console.log(JSON.stringify({
           success: true,
           message: "Aufnahme gestoppt",
@@ -119,9 +115,11 @@ async function main() {
 
     case "toggle":
       if (status.status === "recording") {
-        fs.writeFileSync(STOP_TRIGGER, "");
-        await new Promise(r => setTimeout(r, 2000));
-        const transcript = getTranscript();
+        atomicWriteFile(paths.stopTrigger, "");
+        if (waitMs > 0) {
+          await new Promise((r) => setTimeout(r, waitMs));
+        }
+        const transcript = getTranscript(paths.transcriptFile);
         console.log(JSON.stringify({
           success: true,
           message: "Aufnahme gestoppt",
@@ -129,7 +127,7 @@ async function main() {
           status: "ready"
         }, null, 2));
       } else {
-        fs.writeFileSync(START_TRIGGER, "");
+        atomicWriteFile(paths.startTrigger, "");
         console.log(JSON.stringify({
           success: true,
           message: "Aufnahme gestartet",
@@ -138,20 +136,21 @@ async function main() {
       }
       break;
 
-    case "get":
-      const transcript = getTranscript();
+    case "get": {
+      const transcript = getTranscript(paths.transcriptFile);
       console.log(JSON.stringify({
         success: true,
         transcript: transcript,
         status: status.status
       }, null, 2));
       break;
+    }
 
     default:
       console.log(JSON.stringify({
         success: false,
         error: "invalid_action",
-        message: `Unbekannte Aktion: ${action}. Verfuegbar: start, stop, toggle, get`
+        message: `Unbekannte Aktion: ${String(rawAction)}. Verfuegbar: start, stop, toggle, get`
       }, null, 2));
   }
 }

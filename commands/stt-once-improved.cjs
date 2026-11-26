@@ -11,32 +11,32 @@
  */
 
 const { execFile } = require("node:child_process");
-const path = require("path");
+const path = require("node:path");
+const {
+  readStdinJson,
+  resolvePythonCommand,
+  validateLanguage,
+  validatePositiveNumber
+} = require("../lib/stt-runtime.cjs");
 
 // Provider scripts
 const CLOUD_SCRIPT = "stt_cloud.py";
 const LOCAL_SCRIPT = "stt_once.py";
 
-async function readStdinJson() {
-  const chunks = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(chunk);
-  }
-  if (!chunks.length) return {};
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch (err) {
-    console.error("Failed to parse JSON input:", err.message);
-    process.exit(1);
-  }
-}
-
-function runPythonScript(script, payload) {
+function runPythonScript(script, validated) {
   return new Promise((resolve) => {
     const scriptPath = path.join(__dirname, "..", script);
+    const pythonCmd = resolvePythonCommand();
+
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
 
     const child = execFile(
-      "python3",
+      pythonCmd,
       [scriptPath],
       {
         cwd: path.join(__dirname, ".."),
@@ -44,28 +44,28 @@ function runPythonScript(script, payload) {
         timeout: 120000, // 2 minutes max
         env: {
           ...process.env,
-          STT_LANGUAGE: payload.language || "",
-          STT_MAX_SECONDS: payload.max_seconds != null ? String(payload.max_seconds) : "",
-          STT_SILENCE_TIMEOUT: payload.silence_timeout != null ? String(payload.silence_timeout) : "",
-          STT_SILENCE_THRESHOLD: payload.silence_threshold != null ? String(payload.silence_threshold) : ""
+          STT_LANGUAGE: validated.language,
+          STT_MAX_SECONDS: validated.maxSeconds != null ? String(validated.maxSeconds) : "",
+          STT_SILENCE_TIMEOUT: validated.silenceTimeout != null ? String(validated.silenceTimeout) : "",
+          STT_SILENCE_THRESHOLD: validated.silenceThreshold != null ? String(validated.silenceThreshold) : ""
         }
       },
       (error, stdout, stderr) => {
         if (error) {
           if (error.code === "ENOENT") {
-            resolve({
+            finish({
               ok: false,
               type: "missing",
-              message: `python3 or ${script} not found. Ensure Python is installed.`
+              message: `${pythonCmd} or ${script} not found. Ensure Python is installed.`
             });
           } else if (error.killed) {
-            resolve({
+            finish({
               ok: false,
               type: "timeout",
               message: "Recording timed out after 2 minutes."
             });
           } else {
-            resolve({
+            finish({
               ok: false,
               type: "error",
               message: `${script} error:\n${stderr.toString().trim() || error.message}`
@@ -74,9 +74,9 @@ function runPythonScript(script, payload) {
         } else {
           try {
             const data = JSON.parse(stdout.toString() || "{}");
-            resolve({ ok: true, data });
-          } catch (err) {
-            resolve({
+            finish({ ok: true, data });
+          } catch {
+            finish({
               ok: false,
               type: "parse_error",
               message: `Failed to parse output from ${script}.\nRaw:\n${stdout.toString().trim()}`
@@ -88,21 +88,41 @@ function runPythonScript(script, payload) {
 
     child.on("error", (err) => {
       if (err.code === "ENOENT") {
-        resolve({
+        finish({
           ok: false,
           type: "missing",
-          message: `python3 not found. Install Python 3.`
+          message: `${pythonCmd} not found. Install Python 3.`
         });
       }
     });
   });
 }
 
+function failJson(errorType, message, extra = {}) {
+  const response = {
+    success: false,
+    error_type: errorType,
+    message,
+    retryable: false,
+    ...extra
+  };
+  process.stdout.write(JSON.stringify(response, null, 2));
+  process.exit(1);
+}
+
 async function main() {
-  const payload = await readStdinJson();
+  const input = await readStdinJson({ strict: true });
+  if (!input.ok) {
+    failJson(input.error, input.message);
+  }
+  const payload = input.data;
 
   // Default to cloud provider (faster)
-  const provider = (payload.provider || "cloud").toLowerCase();
+  const rawProvider = payload.provider === undefined || payload.provider === null ? "cloud" : payload.provider;
+  if (typeof rawProvider !== "string") {
+    failJson("invalid_provider", "Invalid 'provider': expected a string.");
+  }
+  const provider = rawProvider.trim().toLowerCase() || "cloud";
 
   let script;
   if (provider === "local") {
@@ -110,45 +130,53 @@ async function main() {
   } else if (provider === "cloud" || provider === "openai") {
     script = CLOUD_SCRIPT;
   } else {
-    const response = {
-      success: false,
-      error_type: "invalid_provider",
-      message: `Unknown provider "${provider}". Use "cloud" (recommended) or "local".`,
-      retryable: false
-    };
-    process.stdout.write(JSON.stringify(response, null, 2));
-    process.exit(1);
+    failJson("invalid_provider", `Unknown provider "${provider}". Use "cloud" (recommended) or "local".`);
   }
+
+  const langCheck = validateLanguage(payload.language);
+  if (!langCheck.ok) failJson("invalid_input", langCheck.message, { provider });
+
+  const maxSecCheck = validatePositiveNumber(payload.max_seconds, {
+    name: "max_seconds",
+    min: 0.1,
+    max: 3600,
+    defaultValue: null
+  });
+  if (!maxSecCheck.ok) failJson("invalid_input", maxSecCheck.message, { provider });
+
+  const silenceTimeoutCheck = validatePositiveNumber(payload.silence_timeout, {
+    name: "silence_timeout",
+    min: 0.05,
+    max: 600,
+    defaultValue: null
+  });
+  if (!silenceTimeoutCheck.ok) failJson("invalid_input", silenceTimeoutCheck.message, { provider });
+
+  const silenceThreshCheck = validatePositiveNumber(payload.silence_threshold, {
+    name: "silence_threshold",
+    min: 0.05,
+    max: 300,
+    defaultValue: null
+  });
+  if (!silenceThreshCheck.ok) failJson("invalid_input", silenceThreshCheck.message, { provider });
 
   console.error(`Using STT provider: ${provider}`);
 
-  const result = await runPythonScript(script, payload);
+  const result = await runPythonScript(script, {
+    language: langCheck.value,
+    maxSeconds: maxSecCheck.value,
+    silenceTimeout: silenceTimeoutCheck.value,
+    silenceThreshold: silenceThreshCheck.value
+  });
 
   if (!result.ok) {
-    const response = {
-      success: false,
-      error_type: result.type,
-      message: result.message,
-      provider: provider,
-      retryable: false
-    };
-    process.stdout.write(JSON.stringify(response, null, 2));
-    process.exit(1);
+    failJson(result.type, result.message, { provider });
   }
 
   const data = result.data || {};
 
   if (data.success === false) {
-    // Python script returned an error
-    const response = {
-      success: false,
-      error_type: data.error || "error",
-      message: data.message || "Unknown error",
-      provider: provider,
-      retryable: false
-    };
-    process.stdout.write(JSON.stringify(response, null, 2));
-    process.exit(1);
+    failJson(data.error || "error", data.message || "Unknown error", { provider });
   }
 
   const response = {

@@ -4,9 +4,9 @@
 # Install STT Commands for Claude Code
 #
 
-set -e
+set -euo pipefail
 
-PLUGIN_DIR="/home/ralle/claude-code-multimodel/plugins/realtimestt-bridge"
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMMANDS_DIR="$HOME/.claude/commands"
 
 echo "=== RealtimeSTT Bridge - Install Commands ==="

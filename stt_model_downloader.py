@@ -23,6 +23,8 @@ import socket
 import sys
 from pathlib import Path
 
+from stt_common import atomic_write_text, get_hf_cache_dir, is_path_within
+
 # Modell-Definitionen mit korrekten HuggingFace IDs
 MODELS = {
     "tiny": {
@@ -68,29 +70,36 @@ MODELS = {
     }
 }
 
-HF_CACHE_DIR = Path.home() / ".cache" / "huggingface" / "hub"
-CONFIG_DIR = Path.home() / ".config" / "claude-stt"
+HF_CACHE_DIR = get_hf_cache_dir()
+CONFIG_DIR = Path(os.getenv("STT_CONFIG_DIR") or (Path.home() / ".config" / "claude-stt"))
 SELECTED_MODEL_FILE = CONFIG_DIR / "selected_model"
 
 
 def check_internet_connection(timeout=5):
     """Prueft ob Internet-Verbindung besteht."""
     try:
-        socket.create_connection(("huggingface.co", 443), timeout=timeout)
-        return True
-    except (socket.timeout, socket.error):
+        with socket.create_connection(("huggingface.co", 443), timeout=timeout):
+            return True
+    except OSError:
         return False
 
 
 def get_free_disk_space_mb():
-    """Gibt freien Speicherplatz in MB zurueck."""
-    stat = os.statvfs(str(HF_CACHE_DIR.parent))
-    return (stat.f_frsize * stat.f_bavail) // (1024 * 1024)
+    """Gibt freien Speicherplatz in MB zurueck (Linux, macOS & Windows)."""
+    target = HF_CACHE_DIR
+    while not target.exists():
+        parent = target.parent
+        if parent == target:
+            target = Path.home()
+            break
+        target = parent
+    usage = shutil.disk_usage(str(target))
+    return usage.free // (1024 * 1024)
 
 
 def get_model_cache_dir(model_key):
     """Gibt den Cache-Pfad fuer ein Modell zurueck."""
-    if model_key not in MODELS:
+    if not isinstance(model_key, str) or model_key not in MODELS:
         return None
 
     hf_id = MODELS[model_key]["hf_id"]
@@ -137,6 +146,8 @@ def clean_model_cache(model_key):
     """Entfernt korrupten/unvollstaendigen Cache fuer ein Modell."""
     cache_dir = get_model_cache_dir(model_key)
     if cache_dir and cache_dir.exists():
+        if not is_path_within(cache_dir, HF_CACHE_DIR):
+            raise ValueError(f"Refusing to delete path outside HF_CACHE_DIR: {cache_dir}")
         shutil.rmtree(cache_dir)
         return True
     return False
@@ -227,7 +238,10 @@ def download_model(model_key):
         error_msg = str(e)
 
         # Bereinige fehlerhaften Download
-        clean_model_cache(model_key)
+        try:
+            clean_model_cache(model_key)
+        except OSError:
+            pass
 
         # Spezifische Fehlermeldungen
         if "Unable to open file" in error_msg:
@@ -276,19 +290,24 @@ def get_status():
 
 def get_selected_model():
     """Gibt aktuell ausgewaehltes Modell zurueck."""
-    if SELECTED_MODEL_FILE.exists():
-        return SELECTED_MODEL_FILE.read_text().strip()
+    try:
+        if SELECTED_MODEL_FILE.exists() and not SELECTED_MODEL_FILE.is_symlink():
+            selected = SELECTED_MODEL_FILE.read_text(encoding="utf-8").strip()
+            if selected in MODELS:
+                return selected
+    except OSError:
+        pass
     return "tiny"
 
 
 def set_selected_model(model_key):
     """Setzt das ausgewaehlte Modell."""
-    if model_key not in MODELS:
+    if not isinstance(model_key, str) or model_key not in MODELS:
         return False
     if not is_model_downloaded(model_key):
         return False
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    SELECTED_MODEL_FILE.write_text(model_key)
+    atomic_write_text(SELECTED_MODEL_FILE, model_key)
     return True
 
 
@@ -453,6 +472,13 @@ def main():
                 "success": False,
                 "error": "missing_model",
                 "message": "Bitte Modell angeben"
+            }))
+            return
+        if model_key not in MODELS:
+            print(json.dumps({
+                "success": False,
+                "error": "invalid_model",
+                "message": f"Unbekanntes Modell: {model_key}"
             }))
             return
         if clean_model_cache(model_key):

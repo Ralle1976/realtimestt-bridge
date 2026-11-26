@@ -11,7 +11,7 @@ const { spawn } = require("node:child_process");
 const path = require("path");
 
 // Forward to stt-models with list action
-const sttModels = spawn("node", [
+const sttModels = spawn(process.execPath, [
   path.join(__dirname, "stt-models.cjs")
 ], {
   stdio: ["pipe", "inherit", "inherit"]
@@ -27,5 +27,5 @@ sttModels.on("error", (err) => {
 });
 
 sttModels.on("close", (code) => {
-  process.exit(code || 0);
+  process.exit(code ?? 1);
 });

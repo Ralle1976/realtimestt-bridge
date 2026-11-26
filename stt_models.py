@@ -18,8 +18,11 @@ Selected model is stored in: ~/.config/claude-stt/selected_model
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
+
+from stt_common import atomic_write_text, get_hf_cache_dir, is_path_within
 
 # Model definitions with metadata
 MODELS = {
@@ -85,11 +88,11 @@ MODELS = {
 }
 
 # Config directory for selected model
-CONFIG_DIR = Path.home() / ".config" / "claude-stt"
+CONFIG_DIR = Path(os.getenv("STT_CONFIG_DIR") or (Path.home() / ".config" / "claude-stt"))
 SELECTED_MODEL_FILE = CONFIG_DIR / "selected_model"
 
 # HuggingFace cache directory
-HF_CACHE_DIR = Path.home() / ".cache" / "huggingface" / "hub"
+HF_CACHE_DIR = get_hf_cache_dir()
 
 
 def ensure_config_dir():
@@ -99,23 +102,28 @@ def ensure_config_dir():
 
 def get_selected_model() -> str:
     """Get currently selected model, default to 'tiny'."""
-    if SELECTED_MODEL_FILE.exists():
-        return SELECTED_MODEL_FILE.read_text().strip()
+    try:
+        if SELECTED_MODEL_FILE.exists() and not SELECTED_MODEL_FILE.is_symlink():
+            selected = SELECTED_MODEL_FILE.read_text(encoding="utf-8").strip()
+            if selected in MODELS:
+                return selected
+    except OSError:
+        pass
     return "tiny"  # Default
 
 
 def set_selected_model(model: str) -> bool:
     """Set the currently selected model."""
-    if model not in MODELS:
+    if not isinstance(model, str) or model not in MODELS:
         return False
     ensure_config_dir()
-    SELECTED_MODEL_FILE.write_text(model)
+    atomic_write_text(SELECTED_MODEL_FILE, model)
     return True
 
 
 def is_model_downloaded(model: str) -> bool:
     """Check if a model is downloaded in HuggingFace cache."""
-    if model not in MODELS:
+    if not isinstance(model, str) or model not in MODELS:
         return False
 
     hf_id = MODELS[model]["hf_id"]
@@ -163,7 +171,7 @@ def get_all_model_status() -> dict:
 
 def download_model(model: str) -> dict:
     """Download a model using faster-whisper."""
-    if model not in MODELS:
+    if not isinstance(model, str) or model not in MODELS:
         return {
             "success": False,
             "error": "invalid_model",
@@ -211,7 +219,7 @@ def download_model(model: str) -> dict:
 
 def select_model(model: str) -> dict:
     """Select a model for use (must be downloaded first)."""
-    if model not in MODELS:
+    if not isinstance(model, str) or model not in MODELS:
         return {
             "success": False,
             "error": "invalid_model",
@@ -237,7 +245,7 @@ def select_model(model: str) -> dict:
 
 def remove_model(model: str) -> dict:
     """Remove a downloaded model."""
-    if model not in MODELS:
+    if not isinstance(model, str) or model not in MODELS:
         return {
             "success": False,
             "error": "invalid_model",
@@ -255,8 +263,14 @@ def remove_model(model: str) -> dict:
     dir_name = f"models--{hf_id.replace('/', '--')}"
     model_dir = HF_CACHE_DIR / dir_name
 
+    if not is_path_within(model_dir, HF_CACHE_DIR):
+        return {
+            "success": False,
+            "error": "unsafe_path",
+            "message": "Refusing to remove directory outside HuggingFace cache."
+        }
+
     try:
-        import shutil
         shutil.rmtree(model_dir)
 
         # If removed model was selected, reset to default
@@ -353,8 +367,13 @@ def main():
         else:
             input_data = {"action": "list"}
 
-    action = input_data.get("action", "list")
-    model = input_data.get("model")
+    if not isinstance(input_data, dict):
+        input_data = {"action": "list"}
+
+    raw_action = input_data.get("action", "list")
+    action = raw_action.strip().lower() if isinstance(raw_action, str) else ""
+    raw_model = input_data.get("model")
+    model = raw_model.strip() if isinstance(raw_model, str) else None
 
     if action == "list":
         # Human-readable list

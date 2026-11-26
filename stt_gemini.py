@@ -18,16 +18,23 @@ Environment Variables:
   STT_SILENCE_THRESHOLD - Silence duration to stop recording, default: 2.0
 """
 
-import base64
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import wave
 from pathlib import Path
+
+from stt_common import (
+    MODEL_NAME_PATTERN,
+    calculate_rms,
+    parse_positive_float_env,
+    validate_language,
+)
 
 # Audio recording parameters
 CHUNK = 1024
@@ -47,20 +54,26 @@ def check_dependencies():
     except ImportError:
         missing.append("pyaudio")
 
-    # Check gemini CLI
-    try:
-        result = subprocess.run(
-            ["gemini", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode != 0:
-            missing.append("gemini-cli (not working)")
-    except FileNotFoundError:
+    # Check gemini CLI (resolve via PATH for cross-platform Windows .cmd support without shell=True)
+    gemini_bin = shutil.which("gemini")
+    if not gemini_bin:
         missing.append("gemini-cli (not installed)")
-    except Exception:
-        missing.append("gemini-cli (error)")
+    else:
+        try:
+            result = subprocess.run(
+                [gemini_bin, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5
+            )
+            if result.returncode != 0:
+                missing.append("gemini-cli (not working)")
+        except FileNotFoundError:
+            missing.append("gemini-cli (not installed)")
+        except Exception:
+            missing.append("gemini-cli (error)")
 
     if missing:
         return {
@@ -76,45 +89,44 @@ def check_dependencies():
 def record_audio(max_seconds: float = 60.0, silence_threshold: float = 2.0) -> bytes:
     """Record audio from microphone until silence is detected."""
     import pyaudio
-    import struct
-    import math
 
     p = pyaudio.PyAudio()
-
-    # Find the default input device
-    try:
-        default_device = p.get_default_input_device_info()
-        device_index = default_device['index']
-    except IOError:
-        device_index = None
-        for i in range(p.get_device_count()):
-            dev = p.get_device_info_by_index(i)
-            if dev['maxInputChannels'] > 0:
-                device_index = i
-                break
-
-        if device_index is None:
-            p.terminate()
-            raise RuntimeError("No audio input device found")
-
-    stream = p.open(
-        format=FORMAT_PYAUDIO,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,
-        input_device_index=device_index,
-        frames_per_buffer=CHUNK
-    )
-
+    stream = None
     frames = []
-    start_time = time.time()
-    last_sound_time = time.time()
-    has_speech = False
-    SILENCE_RMS_THRESHOLD = 500
-
-    print("Recording... (speak now)", file=sys.stderr)
 
     try:
+        # Find the default input device
+        try:
+            default_device = p.get_default_input_device_info()
+            device_index = default_device["index"]
+        except IOError:
+            device_index = None
+            for i in range(p.get_device_count()):
+                dev = p.get_device_info_by_index(i)
+                if dev["maxInputChannels"] > 0:
+                    device_index = i
+                    break
+
+            if device_index is None:
+                raise RuntimeError("No audio input device found")
+
+        audio_format = FORMAT_PYAUDIO if FORMAT_PYAUDIO is not None else pyaudio.paInt16
+        stream = p.open(
+            format=audio_format,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            input_device_index=device_index,
+            frames_per_buffer=CHUNK
+        )
+
+        start_time = time.time()
+        last_sound_time = start_time
+        has_speech = False
+        SILENCE_RMS_THRESHOLD = 500
+
+        print("Recording... (speak now)", file=sys.stderr)
+
         while True:
             elapsed = time.time() - start_time
             if elapsed > max_seconds:
@@ -123,8 +135,7 @@ def record_audio(max_seconds: float = 60.0, silence_threshold: float = 2.0) -> b
             data = stream.read(CHUNK, exception_on_overflow=False)
             frames.append(data)
 
-            shorts = struct.unpack(f'{CHUNK}h', data)
-            rms = math.sqrt(sum(s ** 2 for s in shorts) / CHUNK)
+            rms = calculate_rms(data)
 
             if rms > SILENCE_RMS_THRESHOLD:
                 has_speech = True
@@ -134,8 +145,11 @@ def record_audio(max_seconds: float = 60.0, silence_threshold: float = 2.0) -> b
                 break
 
     finally:
-        stream.stop_stream()
-        stream.close()
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            finally:
+                stream.close()
         p.terminate()
 
     print("Recording finished.", file=sys.stderr)
@@ -153,46 +167,59 @@ def record_audio(max_seconds: float = 60.0, silence_threshold: float = 2.0) -> b
 
 def transcribe_with_gemini(audio_data: bytes, language: str = None) -> dict:
     """Use Gemini CLI to transcribe audio."""
+    try:
+        validated_language = validate_language(language)
+    except ValueError as exc:
+        return {
+            "success": False,
+            "error": "invalid_input",
+            "message": str(exc),
+            "retryable": False
+        }
 
-    # Save audio to temp file
+    gemini_model = (os.getenv("STT_GEMINI_MODEL") or "gemini-2.5-pro").strip()
+    if not MODEL_NAME_PATTERN.fullmatch(gemini_model):
+        return {
+            "success": False,
+            "error": "invalid_config",
+            "message": f"Invalid STT_GEMINI_MODEL value: '{gemini_model}'",
+            "retryable": False
+        }
+
+    gemini_bin = shutil.which("gemini")
+    if not gemini_bin:
+        return {
+            "success": False,
+            "error": "missing_dependencies",
+            "message": "gemini-cli not found in PATH.",
+            "retryable": False
+        }
+
+    # Save audio to private temp file
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(audio_data)
         tmp_path = tmp.name
 
     try:
-        # Build prompt for Gemini
-        lang_hint = f" in {language}" if language else ""
-        prompt = f"""Transcribe the following audio file{lang_hint}.
-Return ONLY the transcribed text, nothing else.
-No explanations, no formatting, just the spoken words.
-If there is no speech or it's unclear, respond with: [NO_SPEECH]
-
-Audio file: {tmp_path}"""
-
-        # Note: Gemini CLI may need the file path passed differently
-        # For now, we'll use base64 encoding in the prompt
-        with open(tmp_path, "rb") as f:
-            audio_b64 = base64.b64encode(f.read()).decode()
-
-        # Alternative prompt with base64
-        prompt = f"""I have an audio recording that I need transcribed{lang_hint}.
-The audio is base64 encoded WAV format.
-
-Please transcribe the spoken words. Return ONLY the transcript text.
-If there is no clear speech, respond with exactly: [NO_SPEECH]
-
-Base64 audio (WAV, 16kHz, mono):
-{audio_b64[:100]}...
-
-[Note: This is a speech-to-text request. Please transcribe what you hear in the audio.]"""
+        lang_hint = f" in {validated_language}" if validated_language else ""
+        prompt = (
+            f"Transcribe the following audio file{lang_hint}.\n"
+            "Return ONLY the transcribed text, nothing else.\n"
+            "No explanations, no formatting, just the spoken words.\n"
+            "If there is no speech or it's unclear, respond with: [NO_SPEECH]\n\n"
+            f"Audio file: {tmp_path}\n"
+        )
 
         start = time.time()
 
-        # Call Gemini CLI
+        # Pass prompt via stdin to prevent CLI flag injection and OS command-line length limits
         result = subprocess.run(
-            ["gemini", "-m", "gemini-2.5-pro", prompt],
+            [gemini_bin, "-m", gemini_model],
+            input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60
         )
 
@@ -257,8 +284,8 @@ Base64 audio (WAV, 16kHz, mono):
 
     finally:
         try:
-            Path(tmp_path).unlink()
-        except:
+            Path(tmp_path).unlink(missing_ok=True)
+        except OSError:
             pass
 
 
@@ -270,9 +297,18 @@ def main():
         print(json.dumps(dep_error))
         return
 
-    language = os.getenv("STT_LANGUAGE") or None
-    max_seconds = float(os.getenv("STT_MAX_SECONDS") or "60")
-    silence_threshold = float(os.getenv("STT_SILENCE_THRESHOLD") or "2.0")
+    try:
+        language = validate_language(os.getenv("STT_LANGUAGE"))
+        max_seconds = parse_positive_float_env("STT_MAX_SECONDS", 60.0, min_value=0.1, max_value=3600.0)
+        silence_threshold = parse_positive_float_env("STT_SILENCE_THRESHOLD", 2.0, min_value=0.05, max_value=300.0)
+    except ValueError as exc:
+        print(json.dumps({
+            "success": False,
+            "error": "invalid_config",
+            "message": str(exc),
+            "retryable": False
+        }))
+        return
 
     try:
         audio_data = record_audio(max_seconds=max_seconds, silence_threshold=silence_threshold)

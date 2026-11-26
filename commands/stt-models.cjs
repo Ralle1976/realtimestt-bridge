@@ -7,17 +7,22 @@
  * - list: Show all available models
  * - status: Show which models are downloaded
  * - download <model>: Download a specific model
+ * - select <model>: Select a downloaded model
  * - remove <model>: Remove a downloaded model
  */
 
-const { execSync, spawn } = require("node:child_process");
-const fs = require("fs");
-const path = require("path");
-const os = require("os");
-
-// Config directory for selected model
-const CONFIG_DIR = path.join(os.homedir(), ".config", "claude-stt");
-const SELECTED_MODEL_FILE = path.join(CONFIG_DIR, "selected_model");
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const {
+  atomicWriteFile,
+  hasOwn,
+  isPathWithin,
+  isSymlink,
+  readStdinJson,
+  resolvePythonCommand
+} = require("../lib/stt-runtime.cjs");
 
 // Model definitions
 const MODELS = {
@@ -74,56 +79,85 @@ const MODELS = {
   }
 };
 
-// HuggingFace cache directory
+function getConfigDir() {
+  const override = (process.env.STT_CONFIG_DIR || "").trim();
+  return override || path.join(os.homedir(), ".config", "claude-stt");
+}
+
+function getSelectedModelFile() {
+  return path.join(getConfigDir(), "selected_model");
+}
+
+// HuggingFace cache directory (respects HUGGINGFACE_HUB_CACHE and HF_HOME/hub)
 function getHfCacheDir() {
-  return process.env.HF_HOME ||
-         process.env.HUGGINGFACE_HUB_CACHE ||
-         path.join(os.homedir(), ".cache", "huggingface", "hub");
+  const hubCache = (process.env.HUGGINGFACE_HUB_CACHE || "").trim();
+  if (hubCache) return hubCache;
+  const hfHome = (process.env.HF_HOME || "").trim();
+  if (hfHome) return path.join(hfHome, "hub");
+  return path.join(os.homedir(), ".cache", "huggingface", "hub");
 }
 
-// Ensure config directory exists
 function ensureConfigDir() {
-  if (!fs.existsSync(CONFIG_DIR)) {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  const configDir = getConfigDir();
+  if (!fs.existsSync(configDir)) {
+    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
   }
 }
 
-// Get currently selected model
 function getSelectedModel() {
-  if (fs.existsSync(SELECTED_MODEL_FILE)) {
-    return fs.readFileSync(SELECTED_MODEL_FILE, "utf8").trim();
+  const selectedFile = getSelectedModelFile();
+  try {
+    if (fs.existsSync(selectedFile) && !isSymlink(selectedFile)) {
+      const value = fs.readFileSync(selectedFile, "utf8").trim();
+      if (hasOwn(MODELS, value)) {
+        return value;
+      }
+    }
+  } catch {
+    // Fallback to default on read error
   }
-  return "tiny"; // Default
+  return "tiny";
 }
 
-// Set selected model
 function setSelectedModel(modelKey) {
-  ensureConfigDir();
-  fs.writeFileSync(SELECTED_MODEL_FILE, modelKey);
-}
-
-// Check if model is downloaded
-function isModelDownloaded(modelKey) {
-  const model = MODELS[modelKey];
-  if (!model) return false;
-
-  const cacheDir = getHfCacheDir();
-  const hfId = model.hfId;
-
-  // Standard models are in models--<name>
-  // Custom models are in models--<org>--<name>
-  let modelDir;
-  if (hfId.includes("/")) {
-    modelDir = path.join(cacheDir, `models--${hfId.replace("/", "--")}`);
-  } else {
-    // Standard whisper models from openai
-    modelDir = path.join(cacheDir, `models--Systran--faster-whisper-${hfId}`);
+  if (typeof modelKey !== "string" || !hasOwn(MODELS, modelKey)) {
+    return false;
   }
-
-  return fs.existsSync(modelDir);
+  ensureConfigDir();
+  atomicWriteFile(getSelectedModelFile(), modelKey);
+  return true;
 }
 
-// List all models with status
+function getCandidateModelDirs(modelKey) {
+  if (typeof modelKey !== "string" || !hasOwn(MODELS, modelKey)) {
+    return [];
+  }
+  const cacheDir = getHfCacheDir();
+  const hfId = MODELS[modelKey].hfId;
+
+  if (hfId.includes("/")) {
+    return [path.join(cacheDir, `models--${hfId.replace(/\//g, "--")}`)];
+  }
+  return [
+    path.join(cacheDir, `models--Systran--faster-whisper-${hfId}`),
+    path.join(cacheDir, `models--mobiuslabsgmbh--faster-whisper-${hfId}`),
+    path.join(cacheDir, `models--openai--whisper-${hfId}`)
+  ];
+}
+
+function findDownloadedModelDir(modelKey) {
+  for (const dir of getCandidateModelDirs(modelKey)) {
+    if (fs.existsSync(dir)) {
+      return dir;
+    }
+  }
+  return null;
+}
+
+function isModelDownloaded(modelKey) {
+  return findDownloadedModelDir(modelKey) !== null;
+}
+
 function listModels() {
   const selected = getSelectedModel();
 
@@ -135,7 +169,6 @@ function listModels() {
     const downloaded = isModelDownloaded(key);
     const isSelected = key === selected;
 
-    // Status indicator
     let status;
     if (isSelected && downloaded) {
       status = "[AKTIV] ";
@@ -165,16 +198,15 @@ function listModels() {
   console.log("");
 }
 
-// Select a model (must be downloaded first)
 function selectModel(modelKey) {
-  const model = MODELS[modelKey];
-  if (!model) {
+  if (typeof modelKey !== "string" || !hasOwn(MODELS, modelKey)) {
     return {
       success: false,
       error: "invalid_model",
-      message: `Unbekanntes Modell '${modelKey}'. Verfugbar: ${Object.keys(MODELS).join(", ")}`
+      message: `Unbekanntes Modell '${String(modelKey)}'. Verfugbar: ${Object.keys(MODELS).join(", ")}`
     };
   }
+  const model = MODELS[modelKey];
 
   if (!isModelDownloaded(modelKey)) {
     return {
@@ -198,16 +230,15 @@ function selectModel(modelKey) {
   };
 }
 
-// Download a model
 async function downloadModel(modelKey) {
-  const model = MODELS[modelKey];
-  if (!model) {
+  if (typeof modelKey !== "string" || !hasOwn(MODELS, modelKey)) {
     return {
       success: false,
       error: "invalid_model",
-      message: `Unknown model '${modelKey}'. Use /stt-models {"action": "list"} to see available models.`
+      message: `Unknown model '${String(modelKey)}'. Use /stt-models {"action": "list"} to see available models.`
     };
   }
+  const model = MODELS[modelKey];
 
   if (isModelDownloaded(modelKey)) {
     return {
@@ -219,21 +250,23 @@ async function downloadModel(modelKey) {
   console.log(`\nDownloading model '${modelKey}' (${model.size})...`);
   console.log("This may take a few minutes depending on your connection.\n");
 
-  // Use Python to download via faster-whisper
-  const pythonCode = `
-import sys
-try:
-    from faster_whisper import WhisperModel
-    print(f"Loading model: ${model.hfId}")
-    model = WhisperModel("${model.hfId}", device="cpu", compute_type="int8")
-    print("Download complete!")
-except Exception as e:
-    print(f"Error: {e}", file=sys.stderr)
-    sys.exit(1)
-`;
+  // Pass HuggingFace ID as argv (never interpolated into code or shell string)
+  const pythonCode = [
+    "import sys",
+    "try:",
+    "    from faster_whisper import WhisperModel",
+    "    hf_id = sys.argv[1]",
+    "    print(f'Loading model: {hf_id}')",
+    "    WhisperModel(hf_id, device='cpu', compute_type='int8')",
+    "    print('Download complete!')",
+    "except Exception as e:",
+    "    print(f'Error: {e}', file=sys.stderr)",
+    "    sys.exit(1)"
+  ].join("\n");
 
   try {
-    execSync(`python3 -c '${pythonCode}'`, {
+    const pythonCmd = resolvePythonCommand();
+    execFileSync(pythonCmd, ["-c", pythonCode, model.hfId], {
       stdio: "inherit",
       timeout: 600000 // 10 minutes
     });
@@ -251,18 +284,17 @@ except Exception as e:
   }
 }
 
-// Remove a model
 function removeModel(modelKey) {
-  const model = MODELS[modelKey];
-  if (!model) {
+  if (typeof modelKey !== "string" || !hasOwn(MODELS, modelKey)) {
     return {
       success: false,
       error: "invalid_model",
-      message: `Unknown model '${modelKey}'.`
+      message: `Unknown model '${String(modelKey)}'.`
     };
   }
 
-  if (!isModelDownloaded(modelKey)) {
+  const modelDir = findDownloadedModelDir(modelKey);
+  if (!modelDir) {
     return {
       success: true,
       message: `Model '${modelKey}' is not downloaded.`
@@ -270,17 +302,22 @@ function removeModel(modelKey) {
   }
 
   const cacheDir = getHfCacheDir();
-  const hfId = model.hfId;
-
-  let modelDir;
-  if (hfId.includes("/")) {
-    modelDir = path.join(cacheDir, `models--${hfId.replace("/", "--")}`);
-  } else {
-    modelDir = path.join(cacheDir, `models--Systran--faster-whisper-${hfId}`);
+  if (!isPathWithin(modelDir, cacheDir)) {
+    return {
+      success: false,
+      error: "unsafe_path",
+      message: "Refusing to remove directory outside HuggingFace cache."
+    };
   }
 
   try {
     fs.rmSync(modelDir, { recursive: true, force: true });
+
+    if (getSelectedModel() === modelKey) {
+      const replacement = Object.keys(MODELS).find((k) => isModelDownloaded(k)) || "tiny";
+      setSelectedModel(replacement);
+    }
+
     return {
       success: true,
       message: `Model '${modelKey}' removed successfully.`
@@ -294,7 +331,6 @@ function removeModel(modelKey) {
   }
 }
 
-// Get status of all models
 function getStatus() {
   const status = {};
   let totalDownloaded = 0;
@@ -319,25 +355,11 @@ function getStatus() {
   };
 }
 
-// Read stdin JSON
-async function readStdinJson() {
-  const chunks = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(chunk);
-  }
-  if (!chunks.length) return {};
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch (err) {
-    return {};
-  }
-}
-
-// Main
 async function main() {
   const payload = await readStdinJson();
-  const action = (payload.action || "list").toLowerCase();
-  const modelKey = payload.model;
+  const rawAction = payload.action === undefined || payload.action === null ? "list" : payload.action;
+  const action = typeof rawAction === "string" ? rawAction.trim().toLowerCase() : "";
+  const modelKey = typeof payload.model === "string" ? payload.model.trim() : null;
 
   let result;
 
@@ -391,7 +413,7 @@ async function main() {
       result = {
         success: false,
         error: "invalid_action",
-        message: `Unbekannte Aktion '${action}'. Verfugbar: list, status, download, select, remove`
+        message: `Unbekannte Aktion '${String(rawAction)}'. Verfugbar: list, status, download, select, remove`
       };
   }
 

@@ -6,13 +6,13 @@ Dieser Daemon laeuft KOMPLETT UNABHAENGIG von Claude Code und kann NICHT
 durch blockierte Terminal-Eingaben beeinflusst werden.
 
 Steuerungsmethoden (alle funktionieren auch wenn Claude busy ist):
-1. File-basiert: touch /tmp/stt_start, touch /tmp/stt_stop
-2. Signal-basiert: kill -SIGUSR1 <pid> (toggle), kill -SIGUSR2 <pid> (stop)
+1. File-basiert: Trigger-Dateien im privaten Runtime-Verzeichnis (STT_RUNTIME_DIR / per-user temp dir)
+2. Signal-basiert (POSIX): kill -SIGUSR1 <pid> (toggle), kill -SIGUSR2 <pid> (stop)
 3. Hotkey (wenn evdev verfuegbar): F9 toggle
 
 Ausgabe:
-- Transkript wird nach /tmp/stt_transcript.txt geschrieben
-- Status wird nach /tmp/stt_status geschrieben
+- Transkript wird nach <runtime_dir>/stt_transcript.txt geschrieben
+- Status wird nach <runtime_dir>/stt_status geschrieben
 - Events werden nach ~/.claude/stt_events.jsonl angehaengt
 
 Verwendung:
@@ -23,26 +23,53 @@ Verwendung:
 
 import json
 import os
+import queue
 import signal
+import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-# Pfade
-PID_FILE = Path("/tmp/stt_daemon.pid")
-STATUS_FILE = Path("/tmp/stt_status")
-TRANSCRIPT_FILE = Path("/tmp/stt_transcript.txt")
-START_TRIGGER = Path("/tmp/stt_start")
-STOP_TRIGGER = Path("/tmp/stt_stop")
+from stt_common import (
+    atomic_write_text,
+    get_runtime_dir,
+    is_process_running,
+    read_pid_file,
+    safe_terminate_process,
+    validate_language,
+)
+
+# Private per-user runtime directory (cross-platform, prevents /tmp symlink attacks)
+RUNTIME_DIR = get_runtime_dir()
+PID_FILE = RUNTIME_DIR / "stt_daemon.pid"
+STATUS_FILE = RUNTIME_DIR / "stt_status"
+TRANSCRIPT_FILE = RUNTIME_DIR / "stt_transcript.txt"
+START_TRIGGER = RUNTIME_DIR / "stt_start"
+STOP_TRIGGER = RUNTIME_DIR / "stt_stop"
 EVENTS_FILE = Path.home() / ".claude" / "stt_events.jsonl"
 LOG_FILE = Path.home() / ".claude" / "stt_hotkey.log"
 
 # Konfiguration
-MODEL = os.getenv("STT_MODEL", "distil-de")
-LANGUAGE = os.getenv("STT_LANGUAGE", "de")
+MODEL = (os.getenv("STT_MODEL") or "distil-de").strip() or "distil-de"
+try:
+    LANGUAGE = validate_language(os.getenv("STT_LANGUAGE", "de")) or "de"
+except ValueError:
+    LANGUAGE = "de"
 SAMPLE_RATE = 16000
+
+MODEL_MAPPING = {
+    "tiny": "tiny",
+    "base": "base",
+    "small": "small",
+    "medium": "medium",
+    "large-v3": "large-v3",
+    "distil-de": "large-v3-turbo",
+    "distil-en": "distil-large-v3",
+    "distil-large": "distil-large-v3",
+    "turbo": "large-v3-turbo",
+}
 
 
 def log(msg):
@@ -52,14 +79,14 @@ def log(msg):
     print(log_msg, file=sys.stderr)
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_FILE, "a") as f:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(log_msg + "\n")
-    except:
+    except OSError:
         pass
 
 
 def write_status(status: str, extra: dict = None):
-    """Schreibt Status-Datei fuer externe Abfrage"""
+    """Schreibt Status-Datei atomar fuer externe Abfrage"""
     data = {
         "status": status,
         "timestamp": datetime.now().isoformat(),
@@ -67,7 +94,7 @@ def write_status(status: str, extra: dict = None):
         "model": MODEL,
         **(extra or {})
     }
-    STATUS_FILE.write_text(json.dumps(data))
+    atomic_write_text(STATUS_FILE, json.dumps(data, ensure_ascii=False))
 
 
 def write_event(event_type: str, data: dict = None):
@@ -78,8 +105,8 @@ def write_event(event_type: str, data: dict = None):
         **(data or {})
     }
     EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(EVENTS_FILE, "a") as f:
-        f.write(json.dumps(event) + "\n")
+    with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 class STTHotkeyDaemon:
@@ -90,6 +117,7 @@ class STTHotkeyDaemon:
         self.model = None
         self.stream = None
         self._lock = threading.Lock()
+        self._signal_queue = queue.SimpleQueue()
 
     def load_model(self):
         """Laedt faster-whisper Modell (lazy)"""
@@ -101,18 +129,15 @@ class STTHotkeyDaemon:
             log(f"Lade Modell: {MODEL}...")
             write_status("loading_model")
 
-            # Bestimme Modell-Pfad
-            if MODEL.startswith("distil"):
-                model_name = f"Systran/faster-{MODEL}-whisper-large-v3"
-            else:
-                model_name = MODEL
+            # Bestimme gueltige HuggingFace/faster-whisper Modell-ID
+            model_name = MODEL_MAPPING.get(MODEL, MODEL)
 
             self.model = WhisperModel(
                 model_name,
                 device="cpu",
                 compute_type="int8"
             )
-            log(f"Modell geladen: {MODEL}")
+            log(f"Modell geladen: {MODEL} ({model_name})")
             return True
         except ImportError:
             log("ERROR: faster-whisper nicht installiert. pip install faster-whisper")
@@ -201,11 +226,13 @@ class STTHotkeyDaemon:
                     vad_filter=True
                 )
 
-                transcript = " ".join([seg.text.strip() for seg in segments])
+                transcript = " ".join(
+                    seg.text.strip() for seg in segments if seg.text and seg.text.strip()
+                ).strip()
 
                 if transcript:
                     log(f"Transkript: {transcript}")
-                    TRANSCRIPT_FILE.write_text(transcript)
+                    atomic_write_text(TRANSCRIPT_FILE, transcript)
                     write_event("transcript", {"text": transcript, "duration": duration})
                     write_status("ready", {"last_transcript": transcript})
                 else:
@@ -226,35 +253,50 @@ class STTHotkeyDaemon:
             self.start_recording()
 
     def handle_signal_toggle(self, signum, frame):
-        """SIGUSR1 - Toggle Recording"""
-        log("Signal SIGUSR1 empfangen - Toggle")
-        self.toggle_recording()
+        """SIGUSR1 - Toggle Recording (async-safe queue, avoids lock deadlock)"""
+        self._signal_queue.put("toggle")
 
     def handle_signal_stop(self, signum, frame):
-        """SIGUSR2 - Force Stop Recording"""
-        log("Signal SIGUSR2 empfangen - Force Stop")
-        if self.recording:
-            self.stop_recording()
+        """SIGUSR2 - Force Stop Recording (async-safe queue, avoids lock deadlock)"""
+        self._signal_queue.put("stop")
 
     def handle_signal_term(self, signum, frame):
-        """SIGTERM/SIGINT - Daemon beenden"""
-        log("Beende Daemon...")
+        """SIGTERM/SIGINT - Daemon beenden (async-safe)"""
         self.running = False
-        if self.recording:
-            self.stop_recording()
+        self._signal_queue.put("term")
+
+    def _drain_signals(self):
+        """Verarbeitet eingegangene Signale ausserhalb des Signal-Handlers"""
+        while True:
+            try:
+                action = self._signal_queue.get_nowait()
+            except queue.Empty:
+                break
+            if action == "toggle":
+                log("Signal SIGUSR1 empfangen - Toggle")
+                self.toggle_recording()
+            elif action == "stop":
+                log("Signal SIGUSR2 empfangen - Force Stop")
+                if self.recording:
+                    self.stop_recording()
+            elif action == "term":
+                log("Beende Daemon...")
+                self.running = False
+                if self.recording:
+                    self.stop_recording()
 
     def file_watcher(self):
         """Ueberwacht Trigger-Dateien"""
         while self.running:
             try:
-                if START_TRIGGER.exists():
-                    START_TRIGGER.unlink()
+                if START_TRIGGER.exists() and not START_TRIGGER.is_symlink():
+                    START_TRIGGER.unlink(missing_ok=True)
                     log("Start-Trigger erkannt")
                     if not self.recording:
                         self.start_recording()
 
-                if STOP_TRIGGER.exists():
-                    STOP_TRIGGER.unlink()
+                if STOP_TRIGGER.exists() and not STOP_TRIGGER.is_symlink():
+                    STOP_TRIGGER.unlink(missing_ok=True)
                     log("Stop-Trigger erkannt")
                     if self.recording:
                         self.stop_recording()
@@ -266,17 +308,18 @@ class STTHotkeyDaemon:
 
     def hotkey_listener(self):
         """Optionaler evdev-basierter Hotkey-Listener"""
+        keyboard = None
         try:
             import evdev
-            from evdev import InputDevice, categorize, ecodes
+            from evdev import categorize, ecodes
 
-            # Finde Tastatur
-            devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
-            keyboard = None
-            for dev in devices:
+            # Finde Tastatur und schliesse nicht verwendete Device-Handles sofort
+            for dev_path in evdev.list_devices():
+                dev = evdev.InputDevice(dev_path)
                 if "keyboard" in dev.name.lower() or "kbd" in dev.name.lower():
                     keyboard = dev
                     break
+                dev.close()
 
             if not keyboard:
                 log("Keine Tastatur fuer Hotkey gefunden (evdev)")
@@ -300,23 +343,33 @@ class STTHotkeyDaemon:
             log("Keine Berechtigung fuer /dev/input/* - Hotkey deaktiviert")
         except Exception as e:
             log(f"Hotkey-Listener Error: {e}")
+        finally:
+            if keyboard is not None:
+                try:
+                    keyboard.close()
+                except Exception:
+                    pass
 
     def run(self):
         """Hauptschleife"""
-        # PID speichern
-        PID_FILE.write_text(str(os.getpid()))
+        # PID sicher speichern
+        atomic_write_text(PID_FILE, str(os.getpid()))
 
-        # Signal-Handler
-        signal.signal(signal.SIGUSR1, self.handle_signal_toggle)
-        signal.signal(signal.SIGUSR2, self.handle_signal_stop)
+        # Signal-Handler (SIGUSR1/SIGUSR2 nur auf POSIX verfuegbar)
+        if hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, self.handle_signal_toggle)
+        if hasattr(signal, "SIGUSR2"):
+            signal.signal(signal.SIGUSR2, self.handle_signal_stop)
         signal.signal(signal.SIGTERM, self.handle_signal_term)
         signal.signal(signal.SIGINT, self.handle_signal_term)
 
         log(f"STT Hotkey Daemon gestartet (PID: {os.getpid()})")
         log(f"Modell: {MODEL}, Sprache: {LANGUAGE}")
+        log(f"Runtime-Verzeichnis: {RUNTIME_DIR}")
         log("Steuerung:")
-        log("  - File: touch /tmp/stt_start, touch /tmp/stt_stop")
-        log("  - Signal: kill -SIGUSR1 <pid> (toggle)")
+        log(f"  - File: {START_TRIGGER}, {STOP_TRIGGER}")
+        if hasattr(signal, "SIGUSR1"):
+            log("  - Signal: kill -SIGUSR1 <pid> (toggle)")
         log("  - Hotkey: F9 (falls evdev verfuegbar)")
 
         write_status("ready")
@@ -332,40 +385,71 @@ class STTHotkeyDaemon:
         # Hauptschleife
         try:
             while self.running:
-                time.sleep(0.5)
+                self._drain_signals()
+                time.sleep(0.1)
+            self._drain_signals()
         finally:
+            if self.recording:
+                self.stop_recording()
             # Cleanup
-            if PID_FILE.exists():
-                PID_FILE.unlink()
+            try:
+                if PID_FILE.exists() and not PID_FILE.is_symlink():
+                    PID_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
             write_status("stopped")
             log("Daemon beendet")
 
 
 def get_status():
     """Liest aktuellen Status"""
-    if STATUS_FILE.exists():
+    if STATUS_FILE.exists() and not STATUS_FILE.is_symlink():
         try:
-            return json.loads(STATUS_FILE.read_text())
-        except:
+            return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
             pass
     return {"status": "not_running"}
 
 
 def is_running():
-    """Prueft ob Daemon laeuft"""
+    """Prueft sicher ob Daemon laeuft (verhindert PID<=0 und Windows CTRL_C_EVENT Bug)"""
     if PID_FILE.exists():
-        try:
-            pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)  # Prueft ob Prozess existiert
+        pid = read_pid_file(PID_FILE)
+        if pid is not None and is_process_running(pid):
             return pid
-        except (ProcessLookupError, ValueError):
-            PID_FILE.unlink()
+        try:
+            if not PID_FILE.is_symlink():
+                PID_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
     return None
+
+
+def start_background_daemon():
+    """Startet den Daemon plattformunabhaengig im Hintergrund (POSIX & Windows)."""
+    popen_kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if sys.platform == "win32":
+        creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+        popen_kwargs["creationflags"] = creationflags
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "run"],
+        **popen_kwargs,
+    )
 
 
 def main():
     if len(sys.argv) < 2:
-        print("""
+        print(f"""
 STT Hotkey Daemon - Zuverlaessiger Speech-to-Text Service
 
 Verwendung:
@@ -375,12 +459,9 @@ Verwendung:
   python3 stt_hotkey_daemon.py run     # Startet im Vordergrund (Debug)
 
 Steuerung waehrend Daemon laeuft:
-  touch /tmp/stt_start    # Aufnahme starten
-  touch /tmp/stt_stop     # Aufnahme stoppen
-  kill -SIGUSR1 <pid>     # Toggle Start/Stop
-  kill -SIGUSR2 <pid>     # Force Stop
-
-Transkript wird nach /tmp/stt_transcript.txt geschrieben.
+  Start-Trigger: {START_TRIGGER}
+  Stop-Trigger:  {STOP_TRIGGER}
+  Transkript:    {TRANSCRIPT_FILE}
 """)
         return
 
@@ -395,27 +476,25 @@ Transkript wird nach /tmp/stt_transcript.txt geschrieben.
             }))
             return
 
-        # Fork in Hintergrund
-        if os.fork() > 0:
-            time.sleep(0.5)  # Kurz warten bis Daemon gestartet
-            pid = is_running()
-            print(json.dumps({
-                "success": True,
-                "message": "STT Hotkey Daemon gestartet",
-                "pid": pid,
-                "controls": {
-                    "start": "touch /tmp/stt_start",
-                    "stop": "touch /tmp/stt_stop",
-                    "toggle": f"kill -SIGUSR1 {pid}",
-                    "hotkey": "F9 (falls evdev verfuegbar)"
-                }
-            }))
-            return
-
-        # Daemon-Prozess
-        os.setsid()
-        daemon = STTHotkeyDaemon()
-        daemon.run()
+        start_background_daemon()
+        time.sleep(0.5)  # Kurz warten bis Daemon gestartet
+        pid = is_running()
+        controls = {
+            "start": str(START_TRIGGER),
+            "stop": str(STOP_TRIGGER),
+            "hotkey": "F9 (falls evdev verfuegbar)"
+        }
+        if hasattr(signal, "SIGUSR1") and pid:
+            controls["toggle"] = f"kill -SIGUSR1 {pid}"
+        print(json.dumps({
+            "success": pid is not None,
+            "message": "STT Hotkey Daemon gestartet" if pid else "Daemon konnte nicht gestartet werden",
+            "pid": pid,
+            "runtime_dir": str(RUNTIME_DIR),
+            "transcript_file": str(TRANSCRIPT_FILE),
+            "controls": controls
+        }))
+        return
 
     elif action == "stop":
         pid = is_running()
@@ -426,19 +505,20 @@ Transkript wird nach /tmp/stt_transcript.txt geschrieben.
             }))
             return
 
-        os.kill(pid, signal.SIGTERM)
+        stopped = safe_terminate_process(pid)
         time.sleep(0.3)
         print(json.dumps({
-            "success": True,
-            "message": f"Daemon gestoppt (PID: {pid})"
+            "success": stopped,
+            "message": f"Daemon gestoppt (PID: {pid})" if stopped else f"Daemon konnte nicht gestoppt werden (PID: {pid})"
         }))
 
     elif action == "status":
         pid = is_running()
-        status = get_status()
+        status = get_status() if pid else {"status": "not_running"}
         status["running"] = pid is not None
         if pid:
             status["pid"] = pid
+        status["runtime_dir"] = str(RUNTIME_DIR)
         print(json.dumps(status, indent=2))
 
     elif action == "run":

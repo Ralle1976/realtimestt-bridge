@@ -4,44 +4,41 @@
  * stt-hotkey-stop.cjs - Stoppt den STT Hotkey-Daemon
  */
 
-const { execSync } = require("node:child_process");
 const fs = require("node:fs");
-const path = require("path");
+const {
+  getRuntimePaths,
+  isProcessRunning,
+  isSymlink,
+  readPidFile,
+  readStdinJson
+} = require("../lib/stt-runtime.cjs");
 
-const SCRIPT_DIR = path.dirname(__dirname);
-const DAEMON_SCRIPT = path.join(SCRIPT_DIR, "stt_hotkey_daemon.py");
-const PID_FILE = "/tmp/stt_daemon.pid";
-
-async function readStdinJson() {
-  const chunks = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(chunk);
+function isDaemonRunning(pidFile) {
+  const pid = readPidFile(pidFile);
+  if (pid !== null && isProcessRunning(pid)) {
+    return pid;
   }
-  if (!chunks.length) return {};
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    return {};
-  }
+  return null;
 }
 
-function isDaemonRunning() {
+function cleanupPidFile(pidFile) {
   try {
-    if (fs.existsSync(PID_FILE)) {
-      const pid = parseInt(fs.readFileSync(PID_FILE, "utf8").trim());
-      process.kill(pid, 0);
-      return pid;
+    if (fs.existsSync(pidFile) && !isSymlink(pidFile)) {
+      fs.unlinkSync(pidFile);
     }
-  } catch {}
-  return null;
+  } catch {
+    // Ignore ENOENT/race
+  }
 }
 
 async function main() {
   await readStdinJson();
+  const paths = getRuntimePaths();
 
-  const pid = isDaemonRunning();
+  const pid = isDaemonRunning(paths.pidFile);
 
   if (!pid) {
+    cleanupPidFile(paths.pidFile);
     console.log(JSON.stringify({
       success: true,
       message: "STT Hotkey Daemon laeuft nicht"
@@ -50,28 +47,34 @@ async function main() {
   }
 
   try {
-    // Send SIGTERM
-    process.kill(pid, "SIGTERM");
-
-    // Wait a bit and verify
-    await new Promise(r => setTimeout(r, 500));
-
-    const stillRunning = isDaemonRunning();
-    if (stillRunning) {
-      // Force kill
-      process.kill(pid, "SIGKILL");
+    // Send SIGTERM to validated positive PID
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch (err) {
+      if (err.code !== "ESRCH") {
+        throw err;
+      }
     }
 
-    // Clean up PID file if still exists
-    if (fs.existsSync(PID_FILE)) {
-      fs.unlinkSync(PID_FILE);
+    // Wait briefly and verify
+    await new Promise((r) => setTimeout(r, 300));
+
+    if (isProcessRunning(pid)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (err) {
+        if (err.code !== "ESRCH") {
+          throw err;
+        }
+      }
     }
+
+    cleanupPidFile(paths.pidFile);
 
     console.log(JSON.stringify({
       success: true,
       message: `STT Hotkey Daemon gestoppt (PID: ${pid})`
     }, null, 2));
-
   } catch (err) {
     console.log(JSON.stringify({
       success: false,

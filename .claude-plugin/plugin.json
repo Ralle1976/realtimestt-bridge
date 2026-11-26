@@ -49,7 +49,7 @@
         "properties": {
           "action": {
             "type": "string",
-            "description": "Action: list, status, download, remove",
+            "description": "Action: list, status, download, select, remove",
             "default": "list"
           },
           "model": {

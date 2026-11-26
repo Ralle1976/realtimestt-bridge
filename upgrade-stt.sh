@@ -7,9 +7,9 @@
 # with cloud provider support (OpenAI Whisper API).
 #
 
-set -e
+set -euo pipefail
 
-PLUGIN_DIR="/home/ralle/claude-code-multimodel/plugins/realtimestt-bridge"
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMMANDS_DIR="$HOME/.claude/commands"
 
 echo "=== RealtimeSTT Bridge - Cloud STT Upgrade ==="
@@ -54,6 +54,7 @@ chmod +x "$PLUGIN_DIR/stt_cloud.py"
 echo "Made stt_cloud.py executable"
 
 # Update symlink
+mkdir -p "$COMMANDS_DIR"
 if [ -L "$COMMANDS_DIR/stt-once" ]; then
   rm "$COMMANDS_DIR/stt-once"
 fi

@@ -111,13 +111,13 @@ Commands must be in `~/.claude/commands/`:
 
 ```bash
 # Automatic
-cd /home/ralle/claude-code-multimodel/plugins/realtimestt-bridge
+cd /path/to/realtimestt-bridge
 ./install-stt-commands.sh
 
 # Or manual
-ln -sf /home/ralle/claude-code-multimodel/plugins/realtimestt-bridge/commands/stt-once.cjs ~/.claude/commands/stt-once
-ln -sf /home/ralle/claude-code-multimodel/plugins/realtimestt-bridge/commands/stt-arm.cjs ~/.claude/commands/stt-arm
-ln -sf /home/ralle/claude-code-multimodel/plugins/realtimestt-bridge/commands/stt-disarm.cjs ~/.claude/commands/stt-disarm
+ln -sf /path/to/realtimestt-bridge/commands/stt-once.cjs ~/.claude/commands/stt-once
+ln -sf /path/to/realtimestt-bridge/commands/stt-arm.cjs ~/.claude/commands/stt-arm
+ln -sf /path/to/realtimestt-bridge/commands/stt-disarm.cjs ~/.claude/commands/stt-disarm
 ```
 
 ### Linux/WSL Dependencies
